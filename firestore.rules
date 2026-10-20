@@ -1,0 +1,140 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'admin@campusfind.test' ||
+        request.auth.token.email == 'admin2@campusfind.test'
+      );
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['id', 'name', 'email', 'role', 'status', 'accountStatus']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.name is string && data.name.size() <= 100 &&
+        data.email is string && data.email.size() <= 128 &&
+        data.role in ['student', 'staff', 'admin'] &&
+        data.status in ['pending', 'active'] &&
+        data.accountStatus in ['active', 'suspended'];
+    }
+
+    function isValidItemReport(data) {
+      return data.keys().hasAll(['id', 'userId', 'type', 'itemName', 'category', 'colour', 'location', 'date', 'description', 'status']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.userId is string && data.userId.size() <= 128 &&
+        data.type in ['lost', 'found'] &&
+        data.itemName is string && data.itemName.size() <= 120 &&
+        data.category in [
+          'Laptop / tablet', 'Phone', 'Student ID / cards', 'Wallet',
+          'Bag / backpack', 'Keys', 'Headphones / earbuds', 'Books / stationery',
+          'Clothing', 'Other'
+        ] &&
+        data.colour is string && data.colour.size() <= 50 &&
+        data.location is string && data.location.size() <= 150 &&
+        data.date is string && data.date.size() <= 20 &&
+        data.description is string && data.description.size() <= 2000 &&
+        data.status in [
+          'Submitted', 'Under Review', 'Possible Match',
+          'Pending Verification', 'Returned', 'Rejected', 'Archived'
+        ];
+    }
+
+    function isValidAdminAction(data) {
+      return data.keys().hasAll(['id', 'adminId', 'adminName', 'action', 'details', 'createdAt']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.adminId is string && data.adminId.size() <= 128 &&
+        data.adminName is string && data.adminName.size() <= 100 &&
+        data.action is string && data.action.size() <= 80 &&
+        data.details is string && data.details.size() <= 2000;
+    }
+
+    // Test connection probe
+    match /test/{testId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Admins directory
+    match /admins/{userId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Users Collection (PII Protection - Section 1 & 8)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId) && isOwner(userId) && isValidUser(incoming());
+      allow update: if isValidId(userId) && (
+        isAdmin() ||
+        (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['name']))
+      );
+      allow delete: if false;
+    }
+
+    // Item Reports Collection
+    match /item_reports/{reportId} {
+      allow get: if isValidId(reportId) && (isAdmin() || (isSignedIn() && existing().userId == request.auth.uid));
+      allow list: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+      allow create: if isValidId(reportId) && isSignedIn() && incoming().userId == request.auth.uid && isValidItemReport(incoming());
+      allow update: if isValidId(reportId) && (
+        isAdmin() ||
+        (
+          isSignedIn() &&
+          existing().userId == request.auth.uid &&
+          existing().locked == false &&
+          existing().status != 'Pending Verification' &&
+          existing().status != 'Returned' &&
+          existing().status != 'Archived' &&
+          isValidItemReport(incoming())
+        )
+      );
+      allow delete: if false;
+    }
+
+    // Match Suggestions Collection (Strictly Admin Only)
+    match /match_suggestions/{matchId} {
+      allow read, write: if isValidId(matchId) && isAdmin();
+    }
+
+    // Notifications Collection (Admin Alerts Only)
+    match /notifications/{notificationId} {
+      allow read, write: if isValidId(notificationId) && isAdmin();
+    }
+
+    // Admin Actions Collection (Append-only immutable audit trail)
+    match /admin_actions/{actionId} {
+      allow read: if isValidId(actionId) && isAdmin();
+      allow create: if isValidId(actionId) && isAdmin() && isValidAdminAction(incoming());
+      allow update, delete: if false;
+    }
+  }
+}
